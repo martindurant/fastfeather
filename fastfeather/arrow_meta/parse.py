@@ -30,7 +30,7 @@ def to_dict(obj):
     for name in sorted(names):
         needed = True
         for special in ("Length", "AsNumpy"):
-            if name.endswith(special) and name[:-len(special)]:
+            if name.endswith(special) and name[:-len(special)] in names:
                 needed = False
                 break
         if not needed:
