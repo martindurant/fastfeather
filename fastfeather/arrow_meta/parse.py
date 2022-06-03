@@ -47,14 +47,25 @@ def to_dict(obj):
     return out
 
 
-def parse_from_file(bytestring, cls):
+def parse_from_bytes(bytestring, cls):
     methname = [_ for _ in dir(cls) if _.startswith("GetRootAs")][0]
     return getattr(cls, methname)(bytestring, 0)
+
+
+def parse_feather(infile):
+    """Main entry point: get schema and offsets from file footer"""
+    infile.seek(-10, 2)
+    size = int.from_bytes(infile.read(4), "little")
+    assert infile.read() == b"ARROW1"
+    infile.seek(-size - 10, 2)
+    bytestring = infile.read(size)
+    flb = parse_from_bytes(bytestring, Footer)
+    return to_dict(flb)
 
 
 def test():
     f = open("org/apache/arrow/flatbuf/test.feather", "rb")
     assert f.read(12) == b"ARROW1\x00\x00\xff\xff\xff\xff"  # plus alignment padding plus "continuation" 0xff
     size = int.from_bytes(f.read(4), "little")
-    mes = parse_from_file(f.read(size), Message)
+    mes = parse_from_bytes(f.read(size), Message)
     return mes
