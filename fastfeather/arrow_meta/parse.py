@@ -6,6 +6,7 @@ union_maps = {
     "Header": MessageHeader,
     "Type": Type
 }
+NONE = None
 
 
 def getname(obj, name):
@@ -15,6 +16,8 @@ def getname(obj, name):
         unique = getattr(obj, name + "Type")()
         val = [member for member in dir(union) if getattr(union, member, -1) == unique][0]
         cls = globals()[val]
+        if cls is None:
+            return None
         inst = cls()
         inst.Init(out().Bytes, out().Pos)
         return inst
