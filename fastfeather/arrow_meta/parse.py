@@ -1,4 +1,4 @@
-
+import cramjam
 
 from .flatbuf import *
 
@@ -64,6 +64,30 @@ def parse_feather(infile):
     bytestring = infile.read(size)
     flb = parse_from_bytes(bytestring, Footer)
     return to_dict(flb)
+
+
+codecs = {0: cramjam.lz4.decompress, 1: cramjam.zstd.decompress}
+
+
+def parse_record_batch(infile, offset, meta_size, body_size):
+    assert meta_size % 8 == 0
+    infile.seek(offset)
+    meta = infile.read(meta_size)
+    assert meta[:4] == b"\xff\xff\xff\xff"
+    meta_length = int.from_bytes(meta[4:8], "little")
+    assert meta_length == meta_size - 8
+    body = infile.read(body_size)
+    msg = to_dict(parse_from_bytes(meta[8:], Message))  # 8 bytes for start of me
+    assert msg['HeaderType'] == 'RecordBatch'
+
+    bufs = []
+    codec = codecs[msg["Header"]["Compression"]["Codec"]]
+    for buf_met in msg["Header"]["Buffers"]:
+        bdata = body[buf_met["Offset"]:buf_met["Offset"] + buf_met["Length"]]
+        blen = int.from_bytes(bdata[:8], "little")
+        uncomp = bytes(codec(bdata[8:])) if blen > 0 else bdata[8:]
+        bufs.append(uncomp)
+    return msg, bufs
 
 
 def test():
