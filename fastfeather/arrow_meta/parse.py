@@ -39,7 +39,8 @@ def to_dict(obj):
         if not needed:
             continue
         bit = getname(obj, name)
-        if name.endswith("Type") and name[:-len("Type")]:
+        if name.endswith("Type") and name[:-len("Type")] and name != "IndexType":
+            # NB IndexType is a normal field, breaking the union description convention
             union = union_maps[name[:-len("Type")]]
             bit = str([member for member in dir(union) if getattr(union, member, -1) == bit][0])
         if bit and isinstance(bit, list) and hasattr(bit[0], "Init"):
@@ -69,7 +70,8 @@ def parse_feather(infile):
 codecs = {0: cramjam.lz4.decompress, 1: cramjam.zstd.decompress}
 
 
-def parse_record_batch(infile, offset, meta_size, body_size):
+def parse_batch(infile, BodyLength, MetaDataLength, Offset, buffers=True):
+    offset, meta_size, body_size = Offset, MetaDataLength, BodyLength
     assert meta_size % 8 == 0
     infile.seek(offset)
     meta = infile.read(meta_size)
@@ -77,22 +79,18 @@ def parse_record_batch(infile, offset, meta_size, body_size):
     meta_length = int.from_bytes(meta[4:8], "little")
     assert meta_length == meta_size - 8
     body = infile.read(body_size)
-    msg = to_dict(parse_from_bytes(meta[8:], Message))  # 8 bytes for start of me
-    assert msg['HeaderType'] == 'RecordBatch'
+    msg = to_dict(parse_from_bytes(meta[8:], Message))  # 8 bytes for start of meta
+    if msg['HeaderType'] == 'RecordBatch':
+        part = msg["Header"]
+    elif msg['HeaderType'] == 'DictionaryBatch':
+        part = msg["Header"]["Data"]
 
     bufs = []
-    codec = codecs[msg["Header"]["Compression"]["Codec"]]
-    for buf_met in msg["Header"]["Buffers"]:
-        bdata = body[buf_met["Offset"]:buf_met["Offset"] + buf_met["Length"]]
-        blen = int.from_bytes(bdata[:8], "little")
-        uncomp = bytes(codec(bdata[8:])) if blen > 0 else bdata[8:]
-        bufs.append(uncomp)
-    return msg, bufs
-
-
-def test():
-    f = open("org/apache/arrow/flatbuf/test.feather", "rb")
-    assert f.read(12) == b"ARROW1\x00\x00\xff\xff\xff\xff"  # plus alignment padding plus "continuation" 0xff
-    size = int.from_bytes(f.read(4), "little")
-    mes = parse_from_bytes(f.read(size), Message)
-    return mes
+    if buffers:
+        codec = codecs[part["Compression"]["Codec"]]
+        for buf_met in part["Buffers"]:
+            bdata = body[buf_met["Offset"]:buf_met["Offset"] + buf_met["Length"]]
+            blen = int.from_bytes(bdata[:8], "little")
+            uncomp = bytes(codec(bdata[8:])) if blen > 0 else bdata[8:]
+            bufs.append(uncomp)
+    return part, bufs
