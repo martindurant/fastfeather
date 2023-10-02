@@ -1,9 +1,10 @@
-import enum
 from collections import namedtuple
 import struct
 
 # https://github.com/dvidelabs/flatcc/blob/master/doc/binary-format.md
 # https://flatbuffers.dev/md__internals.html (briefer details)
+
+# https://github.com/apache/arrow/blob/main/format
 
 # this is a struct, not a Table. The middle value is int32, but alignment makes it int64
 block = namedtuple("block", ("offset", "metaDataLength", "bodyLength"))("long", "long", "long")
@@ -14,37 +15,108 @@ key_value = {
 }
 
 
-class Type(enum.Enum):  # actually a Union with many of these being Tables of their own
-    Null = 0
-    Int = 1
-    FloatingPoint = 2
-    Binary = 3
-    Utf8 = 4
-    Bool = 5
-    Decimal = 6
-    Date = 7
-    Time = 8
-    Timestamp = 9
-    Interval = 10
-    List = 11
-    Struct_ = 12
-    Union = 13
-    FixedSizeBinary = 14
-    FixedSizeList = 15
-    Map = 16
-    Duration = 17
-    LargeBinary = 18
-    LargeUtf8 = 19
-    LargeList = 20
-    RunEndEncoded = 21
-    BinaryView = 22
-    Utf8View = 23
+class Union(dict):
+    def __init__(self, bits):
+        super().__init__(enumerate(bits))
 
 
-Int = {
+class Enum(dict):
+    def __init__(self, bits):
+        super().__init__(enumerate(bits))
+
+
+class NamedDict(dict):
+
+    def __init__(self, data, name):
+        super().__init__()
+        self.update(data)
+        self.name = name
+
+    def __repr__(self):
+        return f"{self.name} {super().__repr__()}"
+
+version = Enum(("V1", "V2", "V3", "V4", "V5"))
+field_node = namedtuple("node", ("length", "null_count"))("long", "long")
+
+compression = Enum(("LZ4", "ZSTD"))
+
+body_compression = {
+    "codec": compression,
+    "method": "BUFFER"
+}
+
+buffer = namedtuple("buffer", ("offset", "length"))("long", "long")
+
+record_batch = {
+    "length": "long",
+    "nodes": [field_node],
+    "buffers": [buffer],
+    "compression": body_compression,
+    "variadic_counts": ["long"]
+}
+
+dict_batch = {
+    "id": "long",
+    "data": record_batch,
+    "delta": "bool"
+}
+
+msg_header = Union(
+    (
+        None,
+        None,  # Schema
+        dict_batch,
+        record_batch,
+        None,  # Tensor
+        None  # SparseTensor
+    )
+)
+
+message = {
+    "version": version,
+    "header": msg_header,
+    "body_length": "long",
+    "metadata": [key_value]
+}
+
+Int = NamedDict({
   "bitWidth": "int",
   "is_signed": "bool"
-}
+}, "int")
+FloatingPoint = NamedDict({
+    "precision": Enum(("HALF", "SINGLE", "DOUBLE"))
+}, "float")
+
+Type = Union(
+    (
+        None,
+        "NULL",  # a column where everything is None
+        Int,
+        FloatingPoint,
+        "Binary",
+        "Utf8",
+        "Bool",
+        "Decimal",
+        "Date",
+        "Time",
+        "Timestamp",
+        "Interval",
+        "List",
+        "Struct",
+        "Union",
+        "FixedSizeBinary",
+        "FixedSizeList",
+        "Map",
+        "Duration",
+        "LargeBinary",
+        "LargeUtf8",
+        "LargeList",
+        "RunEndEncoded",
+        "BinaryView",
+        "Utf8View"
+    ),
+)
+
 
 dictionary_encoding = {
   "id": "long",
@@ -56,7 +128,7 @@ dictionary_encoding = {
 field = {
   "name": "string",
   "nullable": "bool",
-  "type": "enum",  # Type
+  "type": Type,
   "dictionary": None,  # dictionary_encoding,
   "children": None,
   "custom_metadata": [key_value]
@@ -67,11 +139,11 @@ schema = {
   "endianness": "enum",
   "fields": [field],
   "custom_metadata": [key_value],
-  "features": ["enum"]
+  "features": [Enum(("UNUSED", "DICTIONARY_REPLACEMENT", "COMPRESSED_BODY"))]
 }
 
 footer = {
-  "version": "enum",
+  "version": version,
   "schema": schema,
   "dictionaries": [block],
   "recordBatches": [block],
@@ -91,38 +163,73 @@ def parse_table(f, fieldspec: dict, root=False):
     f.seek(v0)
     vsize = int.from_bytes(f.read(2), "little")
     tsize = int.from_bytes(f.read(2), "little")
-    n_offsets = min((vsize // 2) - 2, len(fieldspec))
+    n_offsets = (vsize // 2) - 2
     field_offsets = [int.from_bytes(f.read(2), "little") for _ in range(n_offsets)]
-    field_offsets.extend([0] * (len(fieldspec) - len(field_offsets)))
 
     out = {}
-    for off, (fieldname, fieldtype) in zip(field_offsets, fieldspec.items()):
+    specs = iter(fieldspec.items())
+    enum = False
+    etype = None
+    for off in field_offsets:
+
+        if not enum:
+            fieldname, fieldtype = next(specs)
+        else:
+            enum = False
         if off == 0 or fieldtype is None:
             # not present or explicitly skipped
             out[fieldname] = None
             # TODO: may have default value
             continue
-        if fieldname == "dictionary":
-            breakpoint()
+
         f.seek(table0 + off)  # find field
-        out[fieldname] = parse_inner(f, fieldtype)
+
+        # For unions of vector of unions, read only the type / vec of types, and
+        # read the value(s) on the next offset iteration
+        if isinstance(fieldtype, Union) and etype is None:
+            etype = parse_inner(f, "enum")
+            enum = True
+        elif isinstance(fieldtype, list) and isinstance(fieldtype[0], Union) and etype is None:
+            etype = parse_inner(f, ["enum"])
+            enum = True
+        else:
+            out[fieldname] = parse_inner(f, fieldtype, etype=etype)
+            etype = None
+    for fieldname in fieldspec:
+        if fieldname not in out:
+            out[fieldname] = None
 
     return out
 
 
-def parse_inner(f, fieldtype):
+def parse_inner(f, fieldtype, etype=None):
         pos = f.tell()  # start of FIELD
         if fieldtype == "string":
             offset = int.from_bytes(f.read(4), "little")
             f.seek(pos + offset)
             ssize = int.from_bytes(f.read(4), "little")
             val = f.read(ssize)
+        elif isinstance(fieldtype, Enum):
+            return fieldtype[f.read(1)[0]]
         elif isinstance(fieldtype, list):
             # VECTOR; "Nesting vectors is not supported"
             offset = int.from_bytes(f.read(4), "little")
             f.seek(pos + offset)
             vecsize = int.from_bytes(f.read(4), "little")
-            if isinstance(fieldtype[0], (dict, enum.Enum)) or fieldtype[0] == "string":
+            if isinstance(fieldtype[0], Union):
+                # vector of references
+                oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
+                val = []
+                for (origin, offset), et in zip(oroff, etype):
+                    f.seek(origin + offset)
+                    v0 = parse_table(f, fieldtype[et])
+                    v0["etype"] = fieldtype[et].name
+                    val.append(v0)
+
+            elif isinstance(fieldtype[0], Enum):
+                val = [parse_inner(f, fieldtype[0]) for _ in range(vecsize)]
+
+            elif isinstance(fieldtype[0], dict) or fieldtype[0] == "string":
                 # vector of references
                 oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
                 val = []
@@ -132,6 +239,15 @@ def parse_inner(f, fieldtype):
             else:
                 # vector of values
                 val = [parse_inner(f, fieldtype[0]) for _ in range(vecsize)]
+        elif isinstance(fieldtype, Union):
+            # always a collection of tables
+            if isinstance(fieldtype[etype], dict):
+                offset = int.from_bytes(f.read(4), "little")
+                f.seek(pos + offset)
+                val = parse_table(f, fieldtype[etype])
+                val["etype"] = fieldtype[etype].name
+            else:
+                val = fieldtype[etype]
         elif isinstance(fieldtype, dict):
             # TABLE (not struct)
             offset = int.from_bytes(f.read(4), "little")
@@ -140,11 +256,6 @@ def parse_inner(f, fieldtype):
         elif hasattr(fieldtype, "_asdict"):  # named tuple convention
             # STRUCTs, always inlined; "Structs may only contain scalars or other structs"
             val = type(fieldtype)(*(parse_inner(f, _) for _ in fieldtype))
-        elif isinstance(fieldtype, enum.Enum):
-            etype = f.read(1)[0]
-            if etype == 0:
-                val = None
-            # TODO: evaluate enum subtypes
         elif fieldtype in ["enum", "byte"]:
             # simple enum: just get the value
             val = f.read(1)[0]
@@ -160,6 +271,8 @@ def parse_inner(f, fieldtype):
             val = struct.unpack('f', f.read(4))[0]
         elif fieldtype == "double":
             val = struct.unpack('d', f.read(8))[0]
+        else:
+            val = fieldtype  # literal value
         return val
 
 
