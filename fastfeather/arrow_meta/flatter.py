@@ -35,6 +35,7 @@ class NamedDict(dict):
     def __repr__(self):
         return f"{self.name} {super().__repr__()}"
 
+
 version = Enum(("V1", "V2", "V3", "V4", "V5"))
 field_node = namedtuple("node", ("length", "null_count"))("long", "long")
 
@@ -47,19 +48,19 @@ body_compression = {
 
 buffer = namedtuple("buffer", ("offset", "length"))("long", "long")
 
-record_batch = {
+record_batch = NamedDict({
     "length": "long",
     "nodes": [field_node],
     "buffers": [buffer],
     "compression": body_compression,
     "variadic_counts": ["long"]
-}
+}, "record_batch")
 
-dict_batch = {
+dict_batch = NamedDict({
     "id": "long",
     "data": record_batch,
     "delta": "bool"
-}
+}, "dictionary_batch")
 
 msg_header = Union(
     (
@@ -217,7 +218,7 @@ def parse_inner(f, fieldtype, etype=None):
             f.seek(pos + offset)
             vecsize = int.from_bytes(f.read(4), "little")
             if isinstance(fieldtype[0], Union):
-                # vector of references
+                # vector of tables, each a different union member according to etype
                 oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
                 val = []
                 for (origin, offset), et in zip(oroff, etype):
@@ -230,7 +231,7 @@ def parse_inner(f, fieldtype, etype=None):
                 val = [parse_inner(f, fieldtype[0]) for _ in range(vecsize)]
 
             elif isinstance(fieldtype[0], dict) or fieldtype[0] == "string":
-                # vector of references
+                # vector of references (tables or strings)
                 oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
                 val = []
                 for origin, offset in oroff:
@@ -240,13 +241,14 @@ def parse_inner(f, fieldtype, etype=None):
                 # vector of values
                 val = [parse_inner(f, fieldtype[0]) for _ in range(vecsize)]
         elif isinstance(fieldtype, Union):
-            # always a collection of tables
+            # should always be a collection of tables
             if isinstance(fieldtype[etype], dict):
                 offset = int.from_bytes(f.read(4), "little")
                 f.seek(pos + offset)
                 val = parse_table(f, fieldtype[etype])
                 val["etype"] = fieldtype[etype].name
             else:
+                # should not happen
                 val = fieldtype[etype]
         elif isinstance(fieldtype, dict):
             # TABLE (not struct)
@@ -258,6 +260,7 @@ def parse_inner(f, fieldtype, etype=None):
             val = type(fieldtype)(*(parse_inner(f, _) for _ in fieldtype))
         elif fieldtype in ["enum", "byte"]:
             # simple enum: just get the value
+            # NB: an enum can in theory be longer than one byte, but have never seen this
             val = f.read(1)[0]
         elif fieldtype == "bool":
             val = f.read(1)[0] == 1
@@ -283,3 +286,12 @@ def parse_feather(infile):
     assert infile.read() == b"ARROW1"
     infile.seek(-size - 10, 2)
     return parse_table(infile, footer, root=True)
+
+
+def parse_batch(infile, body_size, meta_size, offset):
+    assert meta_size % 8 == 0
+    infile.seek(offset)
+    assert infile.read(4) == b"\xff\xff\xff\xff"
+    meta_length = int.from_bytes(infile.read(4), "little")
+    assert meta_length == meta_size - 8
+    return parse_table(infile, message, root=True)
