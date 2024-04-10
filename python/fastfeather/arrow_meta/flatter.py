@@ -1,3 +1,5 @@
+"""Parse the flatbuffers in a feather footer/batch"""
+
 from collections import namedtuple
 import struct
 
@@ -153,29 +155,36 @@ footer = {
 
 
 def parse_table(f, fieldspec: dict, root=False):
+    """Construct python dic from a flatbuffer table with given spec"""
     if root:
         root_offset = int.from_bytes(f.read(4), "little")  # must be positive
-        f.seek(root_offset - 4, 1)
+        print("root", f.seek(root_offset - 4, 1))
 
     table0 = f.tell()  # start of TABLE
     voff = int.from_bytes(f.read(4), "little", signed=True)
 
     v0 = table0 - voff  # start of Vtable
+    if root:
+        print(voff, v0)
     f.seek(v0)
     vsize = int.from_bytes(f.read(2), "little")
     tsize = int.from_bytes(f.read(2), "little")
     n_offsets = (vsize // 2) - 2
     field_offsets = [int.from_bytes(f.read(2), "little") for _ in range(n_offsets)]
+    print(v0, vsize, n_offsets, field_offsets)
 
     out = {}
     specs = iter(fieldspec.items())
-    enum = False
-    etype = None
+    enum = False  # are we currently in an enum?
+    etype = None  # first value of an enum paid: the enum selector
+    fieldtype = None  # just to make linter happy
+    fieldname = None  # ditto
     for off in field_offsets:
 
         if not enum:
             fieldname, fieldtype = next(specs)
         else:
+            # this is the second value in a union pair - not a new field
             enum = False
         if off == 0 or fieldtype is None:
             # not present or explicitly skipped
@@ -185,12 +194,14 @@ def parse_table(f, fieldspec: dict, root=False):
 
         f.seek(table0 + off)  # find field
 
-        # For unions of vector of unions, read only the type / vec of types, and
+        # For unions or vector of unions, read only the type / vec of types, and
         # read the value(s) on the next offset iteration
         if isinstance(fieldtype, Union) and etype is None:
+            # union
             etype = parse_inner(f, "enum")
             enum = True
         elif isinstance(fieldtype, list) and isinstance(fieldtype[0], Union) and etype is None:
+            # list-of-union
             etype = parse_inner(f, ["enum"])
             enum = True
         else:
@@ -204,79 +215,80 @@ def parse_table(f, fieldspec: dict, root=False):
 
 
 def parse_inner(f, fieldtype, etype=None):
-        pos = f.tell()  # start of FIELD
-        if fieldtype == "string":
-            offset = int.from_bytes(f.read(4), "little")
-            f.seek(pos + offset)
-            ssize = int.from_bytes(f.read(4), "little")
-            val = f.read(ssize)
-        elif isinstance(fieldtype, Enum):
-            return fieldtype[f.read(1)[0]]
-        elif isinstance(fieldtype, list):
-            # VECTOR; "Nesting vectors is not supported"
-            offset = int.from_bytes(f.read(4), "little")
-            f.seek(pos + offset)
-            vecsize = int.from_bytes(f.read(4), "little")
-            if isinstance(fieldtype[0], Union):
-                # vector of tables, each a different union member according to etype
-                oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
-                val = []
-                for (origin, offset), et in zip(oroff, etype):
-                    f.seek(origin + offset)
-                    v0 = parse_table(f, fieldtype[et])
-                    v0["etype"] = fieldtype[et].name
-                    val.append(v0)
+    """Infer single field value within a table or list"""
+    pos = f.tell()  # start of FIELD
+    if fieldtype == "string":
+        offset = int.from_bytes(f.read(4), "little")
+        f.seek(pos + offset)
+        ssize = int.from_bytes(f.read(4), "little")
+        val = f.read(ssize)
+    elif isinstance(fieldtype, Enum):
+        return fieldtype[f.read(1)[0]]
+    elif isinstance(fieldtype, list):
+        # VECTOR; "Nesting vectors is not supported"
+        offset = int.from_bytes(f.read(4), "little")
+        f.seek(pos + offset)
+        vecsize = int.from_bytes(f.read(4), "little")
+        if isinstance(fieldtype[0], Union):
+            # vector of tables, each a different union member according to etype
+            oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
+            val = []
+            for (origin, offset), et in zip(oroff, etype):
+                f.seek(origin + offset)
+                v0 = parse_table(f, fieldtype[et])
+                v0["etype"] = fieldtype[et].name
+                val.append(v0)
 
-            elif isinstance(fieldtype[0], Enum):
-                val = [parse_inner(f, fieldtype[0]) for _ in range(vecsize)]
+        elif isinstance(fieldtype[0], Enum):
+            val = [parse_inner(f, fieldtype[0]) for _ in range(vecsize)]
 
-            elif isinstance(fieldtype[0], dict) or fieldtype[0] == "string":
-                # vector of references (tables or strings)
-                oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
-                val = []
-                for origin, offset in oroff:
-                    f.seek(origin + offset)
-                    val.append(parse_table(f, fieldtype[0]))
-            else:
-                # vector of values
-                val = [parse_inner(f, fieldtype[0]) for _ in range(vecsize)]
-        elif isinstance(fieldtype, Union):
-            # should always be a collection of tables
-            if isinstance(fieldtype[etype], dict):
-                offset = int.from_bytes(f.read(4), "little")
-                f.seek(pos + offset)
-                val = parse_table(f, fieldtype[etype])
-                val["etype"] = fieldtype[etype].name
-            else:
-                # should not happen
-                val = fieldtype[etype]
-        elif isinstance(fieldtype, dict):
-            # TABLE (not struct)
-            offset = int.from_bytes(f.read(4), "little")
-            f.seek(pos + offset)
-            val = parse_table(f, fieldtype)
-        elif hasattr(fieldtype, "_asdict"):  # named tuple convention
-            # STRUCTs, always inlined; "Structs may only contain scalars or other structs"
-            val = type(fieldtype)(*(parse_inner(f, _) for _ in fieldtype))
-        elif fieldtype in ["enum", "byte"]:
-            # simple enum: just get the value
-            # NB: an enum can in theory be longer than one byte, but have never seen this
-            val = f.read(1)[0]
-        elif fieldtype == "bool":
-            val = f.read(1)[0] == 1
-        elif fieldtype == "short":
-            val = int.from_bytes(f.read(2), "little")
-        elif fieldtype == "int":
-            val = int.from_bytes(f.read(4), "little")
-        elif fieldtype == "long":
-            val = int.from_bytes(f.read(8), "little")
-        elif fieldtype == "float":
-            val = struct.unpack('f', f.read(4))[0]
-        elif fieldtype == "double":
-            val = struct.unpack('d', f.read(8))[0]
+        elif isinstance(fieldtype[0], dict) or fieldtype[0] == "string":
+            # vector of references (tables or strings)
+            oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
+            val = []
+            for origin, offset in oroff:
+                f.seek(origin + offset)
+                val.append(parse_table(f, fieldtype[0]))
         else:
-            val = fieldtype  # literal value
-        return val
+            # vector of values
+            val = [parse_inner(f, fieldtype[0]) for _ in range(vecsize)]
+    elif isinstance(fieldtype, Union):
+        # should always be a collection of tables
+        if isinstance(fieldtype[etype], dict):
+            offset = int.from_bytes(f.read(4), "little")
+            f.seek(pos + offset)
+            val = parse_table(f, fieldtype[etype])
+            val["etype"] = fieldtype[etype].name
+        else:
+            # should not happen
+            val = fieldtype[etype]
+    elif isinstance(fieldtype, dict):
+        # TABLE (not struct)
+        offset = int.from_bytes(f.read(4), "little")
+        f.seek(pos + offset)
+        val = parse_table(f, fieldtype)
+    elif hasattr(fieldtype, "_asdict"):  # named tuple convention
+        # STRUCTs, always inlined; "Structs may only contain scalars or other structs"
+        val = type(fieldtype)(*(parse_inner(f, _) for _ in fieldtype))
+    elif fieldtype in ["enum", "byte"]:
+        # simple enum: just get the value
+        # NB: an enum can in theory be longer than one byte, but have never seen this
+        val = f.read(1)[0]
+    elif fieldtype == "bool":
+        val = f.read(1)[0] == 1
+    elif fieldtype == "short":
+        val = int.from_bytes(f.read(2), "little")
+    elif fieldtype == "int":
+        val = int.from_bytes(f.read(4), "little")
+    elif fieldtype == "long":
+        val = int.from_bytes(f.read(8), "little")
+    elif fieldtype == "float":
+        val = struct.unpack('f', f.read(4))[0]
+    elif fieldtype == "double":
+        val = struct.unpack('d', f.read(8))[0]
+    else:
+        val = fieldtype  # literal value
+    return val
 
 
 def parse_feather(infile):
@@ -284,11 +296,12 @@ def parse_feather(infile):
     infile.seek(-10, 2)
     size = int.from_bytes(infile.read(4), "little")
     assert infile.read() == b"ARROW1"
-    infile.seek(-size - 10, 2)
+    print("pos", infile.seek(-size - 10, 2))
     return parse_table(infile, footer, root=True)
 
 
 def parse_batch(infile, body_size, meta_size, offset):
+    """Parse details of given batch"""
     assert meta_size % 8 == 0
     infile.seek(offset)
     assert infile.read(4) == b"\xff\xff\xff\xff"
