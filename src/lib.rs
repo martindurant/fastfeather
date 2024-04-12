@@ -34,11 +34,8 @@ enum ChildType {
     Simple(FlatTypes),
     List(FlatTypes),
     Stru(Vec<FlatTypes>),  // only simple types allowed in flat struct
-    Un(Vec<ChildType>),  // flat union
+    Un(Vec<FlatTypes>),  // flat union
 }
-
-
-
 
 lazy_static! {
     static ref SCHEMAS: HashMap<&'static str, Vec<ChildType>> = {
@@ -55,23 +52,23 @@ lazy_static! {
             ChildType::Simple(FlatTypes::Enum(vec!("HALF", "SINGLE", "DOUBLE")))
         ));
         let typ = vec!(  // feather schema types, not flat types
-            ChildType::Simple(FlatTypes::Value("NULL")), //  # a column where everything is None
-            ChildType::Simple(FlatTypes::Table("int")),
-            ChildType::Simple(FlatTypes::Table("float")),
-            ChildType::Simple(FlatTypes::Value("Binary")),
-            ChildType::Simple(FlatTypes::Value("UTF8")),
-            ChildType::Simple(FlatTypes::Value("Bool")),
-            ChildType::Simple(FlatTypes::Value("Decimal")),
-            ChildType::Simple(FlatTypes::Value("Date")),
-            ChildType::Simple(FlatTypes::Value("Time")),
-            ChildType::Simple(FlatTypes::Value("Timestamp")),
-            ChildType::Simple(FlatTypes::Value("Interval")),
-            ChildType::Simple(FlatTypes::Value("List")),
-            ChildType::Simple(FlatTypes::Value("Struct")),
-            ChildType::Simple(FlatTypes::Value("Union")),
-            ChildType::Simple(FlatTypes::Value("FixedSizeBinary")),
-            ChildType::Simple(FlatTypes::Value("FixedSizeList")),
-            ChildType::Simple(FlatTypes::Value("Map")),
+            FlatTypes::Value("NULL"), //  # a column where everything is None
+            FlatTypes::Table("int"),
+            FlatTypes::Table("float"),
+            FlatTypes::Value("Binary"),
+            FlatTypes::Value("UTF8"),
+            FlatTypes::Value("Bool"),
+            FlatTypes::Value("Decimal"),
+            FlatTypes::Value("Date"),
+            FlatTypes::Value("Time"),
+            FlatTypes::Value("Timestamp"),
+            FlatTypes::Value("Interval"),
+            FlatTypes::Value("List"),
+            FlatTypes::Value("Struct"),
+            FlatTypes::Value("Union"),
+            FlatTypes::Value("FixedSizeBinary"),
+            FlatTypes::Value("FixedSizeList"),
+            FlatTypes::Value("Map"),
         );
         h.insert("field", vec!(
             ChildType::Simple(FlatTypes::Strin),
@@ -91,8 +88,8 @@ lazy_static! {
         h.insert("footer", vec!(
             ChildType::Simple(FlatTypes::Enum(vec!("V1", "V2", "V3", "V4", "V5"))),
             ChildType::Simple(FlatTypes::Table("schema")),
-            ChildType::Simple(FlatTypes::None),
-            ChildType::Simple(FlatTypes::None),
+            ChildType::Simple(FlatTypes::None), //dictionaries
+            ChildType::Simple(FlatTypes::None), //record batches
             ChildType::List(FlatTypes::Table("key_value"))
         ));
         h
@@ -133,7 +130,7 @@ impl IntoPy<PyObject> for OutTypes {
 }
 
 
-// No-copy python string to u8 slice (must not outlive original string)
+// No-copy python buffer-like (e.g., bytes) to u8 slice (must not outlive original)
 #[inline(always)]
 fn py_to_byteslice(value: &PyAny) -> &'static mut [u8] {
     let buf: PyBuffer<u8> = value.extract().unwrap();
@@ -149,14 +146,13 @@ impl FlatTable {
         let voff = LittleEndian::read_u32(&buf[offset..offset+4]) as usize;
         let vsize = LittleEndian::read_u16(&buf[offset - voff..offset - voff + 2]);
         let noffsets = (vsize / 2) - 2;
-        println!("{}", noffsets);
         let mut offsets: Vec<i16> = (offset - voff + 4.. offset - voff + 4 + noffsets as usize * 2)
             .step_by(2)
             .map(|x| LittleEndian::read_i16(&buf[x .. x + 2]))
             .collect();
         Self { name, schema, buf, offset, offsets }
     }
-    fn get_simple_type(&self, py: Python, offset: usize, typ: &FlatTypes) -> OutTypes {
+    fn get_simple_type(&self, offset: usize, typ: &FlatTypes) -> OutTypes {
         match typ {
             FlatTypes::Strin => {
                 let ssize = LittleEndian::read_u32(&self.buf[offset .. offset + 4]) as usize;
@@ -169,7 +165,8 @@ impl FlatTable {
                 OutTypes::Str(v[choice].to_string())
             },
             FlatTypes::Table(name) => {
-                OutTypes::Flat(FlatTable::new(name.to_string(), self.buf.clone(), offset))
+                let toff = LittleEndian::read_u32(&self.buf[offset .. offset + 4]) as usize;
+                OutTypes::Flat(FlatTable::new(name.to_string(), self.buf.clone(), offset + toff))
             },
             FlatTypes::Bool => {
                 OutTypes::Bool(self.buf[offset] > 0)
@@ -191,6 +188,21 @@ impl FlatTable {
             }
             _ => OutTypes::Empty
         }
+    }
+
+    fn get_list(&self, mut offset: usize, typ: &FlatTypes) -> Vec<OutTypes> {
+        let off = LittleEndian::read_u32(&self.buf[offset .. offset + 4]) as usize;
+        let size = LittleEndian::read_u32(&self.buf[offset + off .. offset + off + 4]) as usize;
+        let el_size: usize = match typ {
+            FlatTypes::Bool | FlatTypes::Enum(_) => 1,
+            FlatTypes::Short => 2,
+            FlatTypes::Int | FlatTypes::Strin | FlatTypes::Table(_) | FlatTypes::Float => 4,
+            FlatTypes::Long | FlatTypes::Double => 8,
+            _ => 0
+        };
+        (0..size).map(|i| {
+            self.get_simple_type(off + offset + 4 + i * el_size, typ)
+        }).collect()
     }
 }
 
@@ -216,18 +228,28 @@ impl FlatTable {
         Ok(format!("{:?}", self).into_py(py))
     }
 
-    fn get<'py>(&self, py: Python<'py>, val: usize) -> PyResult<PyObject> {
+    fn get<'py>(&self, py: Python<'py>,mut val: usize) -> PyResult<PyObject> {
+        let typ: &ChildType = self.schema.get(val as usize).unwrap();
+        let i: usize;
+        for i in 0..val {
+            match self.schema.get(i).unwrap() {
+                ChildType::Simple(FlatTypes::Union) => {val += 1;},
+                ChildType::List(FlatTypes::Union) => {val += 1;},
+                _ => ()
+            }
+        }
         if val >= self.offsets.len() {
             return Err(PyIndexError::new_err("Out of range"))
         }
-        let typ: &ChildType = self.schema.get(val as usize).unwrap();
-        let off = self.offsets[val] as usize; // TODO: account for union types
+        let off = self.offsets[val] as usize;
         if off == 0 {
             return Ok(().into_py(py))
         }
         match typ {
             ChildType::Simple(x) =>
-                Ok(self.get_simple_type(py, self.offset + off, x).into_py(py)),
+                Ok(self.get_simple_type(self.offset + off, x).into_py(py)),
+            ChildType::List(typ) =>
+                Ok(self.get_list(self.offset + off, typ).into_py(py)),
             _ => Ok(().into_py(py))
         }
     }
