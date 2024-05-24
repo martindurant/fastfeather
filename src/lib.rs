@@ -38,18 +38,29 @@ enum ChildType {
 }
 
 lazy_static! {
-    static ref SCHEMAS: HashMap<&'static str, Vec<ChildType>> = {
-        let mut h = HashMap::with_capacity(20);
-        h.insert("key_value", vec!(
-            ChildType::Simple(FlatTypes::Strin),
-            ChildType::Simple(FlatTypes::Strin))
+    static ref SCHEMAS: HashMap<&'static str, (Vec<ChildType>, Vec<&'static str>)> = {
+        let mut h: HashMap<&str, (Vec<ChildType>, Vec<&str>)> = HashMap::with_capacity(20);
+        h.insert("key_value",
+            (vec!(
+                ChildType::Simple(FlatTypes::Strin),
+                ChildType::Simple(FlatTypes::Strin)
+            ),
+                vec!("key", "value")
+            )
         );
-        h.insert("int", vec!(
-            ChildType::Simple(FlatTypes::Int),
-            ChildType::Simple(FlatTypes::Bool)
-        ));
-        h.insert("float", vec!(
-            ChildType::Simple(FlatTypes::Enum(vec!("HALF", "SINGLE", "DOUBLE")))
+        h.insert("int",
+            (
+                vec!(ChildType::Simple(FlatTypes::Int),
+                ChildType::Simple(FlatTypes::Bool)
+            ),
+                vec!("bitWidth", "is_signed")
+            )
+        );
+        h.insert("float",
+            (
+                vec!(ChildType::Simple(FlatTypes::Enum(vec!("HALF", "SINGLE", "DOUBLE")))
+            ),
+                vec!("precision")
         ));
         let typ = vec!(  // feather schema types, not flat types
             FlatTypes::Value("NULL"), //  # a column where everything is None
@@ -70,27 +81,40 @@ lazy_static! {
             FlatTypes::Value("FixedSizeList"),
             FlatTypes::Value("Map"),
         );
-        h.insert("field", vec!(
-            ChildType::Simple(FlatTypes::Strin),
-            ChildType::Simple(FlatTypes::Bool),
-            ChildType::Un(typ),
-            ChildType::Simple(FlatTypes::None),
-            ChildType::Simple(FlatTypes::None),
-            ChildType::List(FlatTypes::Table("key_value")),
-            ChildType::List(FlatTypes::Table("field"))
+        h.insert("field",
+            (
+                vec!(
+                    ChildType::Simple(FlatTypes::Strin),
+                    ChildType::Simple(FlatTypes::Bool),
+                    ChildType::Un(typ),
+                    ChildType::Simple(FlatTypes::None),
+                    ChildType::Simple(FlatTypes::None),
+                    ChildType::List(FlatTypes::Table("key_value")),
+                    ChildType::List(FlatTypes::Table("field"))
+            ),
+                vec!("name", "nullable", "type", "dictionary", "children", "custom_metadata")
+
         ));
-        h.insert("schema", vec!(
-            ChildType::Simple(FlatTypes::Enum(vec!("Little", "Big"))),
-            ChildType::List(FlatTypes::Table("field")),
-            ChildType::List(FlatTypes::Table("key_value")),
-            ChildType::List(FlatTypes::Enum(vec!("UNUSED", "DICTIONARY_REPLACEMENT", "COMPRESSED_BODY")))
+        h.insert("schema",
+            (
+                vec!(
+                    ChildType::Simple(FlatTypes::Enum(vec!("Little", "Big"))),
+                    ChildType::List(FlatTypes::Table("field")),
+                    ChildType::List(FlatTypes::Table("key_value")),
+                    ChildType::List(FlatTypes::Enum(vec!("UNUSED", "DICTIONARY_REPLACEMENT", "COMPRESSED_BODY")))
+            ),
+                vec!("endianness", "fields", "custom_metadata", "features")
         ));
-        h.insert("footer", vec!(
-            ChildType::Simple(FlatTypes::Enum(vec!("V1", "V2", "V3", "V4", "V5"))),
-            ChildType::Simple(FlatTypes::Table("schema")),
-            ChildType::Simple(FlatTypes::None), //dictionaries
-            ChildType::Simple(FlatTypes::None), //record batches
-            ChildType::List(FlatTypes::Table("key_value"))
+        h.insert("footer",
+            (
+                vec!(
+                    ChildType::Simple(FlatTypes::Enum(vec!("V1", "V2", "V3", "V4", "V5"))),
+                    ChildType::Simple(FlatTypes::Table("schema")),
+                    ChildType::Simple(FlatTypes::None), //dictionaries
+                    ChildType::Simple(FlatTypes::None), //record batches
+                    ChildType::List(FlatTypes::Table("key_value"))
+            ),
+                vec!("version", "schema", "dictionaries", "record_batches", "custom_metadata")
         ));
         h
     };
@@ -100,7 +124,7 @@ lazy_static! {
 #[derive(Clone)]
 struct FlatTable {
     name: String,
-    schema: &'static Vec<ChildType>,
+    schema: &'static (Vec<ChildType>, Vec<&'static str>),
     buf: Arc<Vec<u8>>,
     offset: usize,
     offsets: Vec<i16>,
@@ -155,10 +179,11 @@ impl FlatTable {
     fn get_simple_type(&self, offset: usize, typ: &FlatTypes) -> OutTypes {
         match typ {
             FlatTypes::Strin => {
-                let ssize = LittleEndian::read_u32(&self.buf[offset .. offset + 4]) as usize;
+                let off = LittleEndian::read_u32(&self.buf[offset .. offset + 4]) as usize;
+                let ssize = LittleEndian::read_u32(&self.buf[offset + off .. offset + off + 4]) as usize;
                 OutTypes::Str(std::str::from_utf8(
                     // UTF8 parse error possible here
-                    &self.buf[offset + 4 .. offset + 4 + ssize]).unwrap().to_string())
+                    &self.buf[offset + off + 4 .. offset + off + 4 + ssize]).unwrap().to_string())
             },
             FlatTypes::Enum(v) => {
                 let choice = self.buf[offset] as usize;
@@ -208,8 +233,7 @@ impl FlatTable {
 
 impl fmt::Debug for FlatTable {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt.debug_struct("Table")
-            .field("name", &self.name)
+        fmt.debug_struct(&format!("Table '{}'\n", self.name))
             .field("schema", &self.schema)
             .field("offset", &self.offset)
             .field("offsets", &format_args!("{:?}", self.offsets))
@@ -228,22 +252,36 @@ impl FlatTable {
         Ok(format!("{:?}", self).into_py(py))
     }
 
-    fn get<'py>(&self, py: Python<'py>,mut val: usize) -> PyResult<PyObject> {
-        let typ: &ChildType = self.schema.get(val as usize).unwrap();
-        let i: usize;
+    fn field_name(&self, num: usize) -> PyResult<String> {
+        Ok(self.schema.1.get(num).unwrap_or((&"None").into()).to_string())
+    }
+
+    fn n_fields(&self) -> PyResult<usize> {
+        Ok(self.schema.0.len())
+    }
+
+    fn get<'py>(&self, py: Python<'py>, mut val: usize) -> PyResult<PyObject> {
+        let typ = self.schema.0.get(val as usize);
+        if typ.is_none() {
+            return Ok(().into_py(py)) // None
+        }
+        let typ: &ChildType = typ.unwrap();
         for i in 0..val {
-            match self.schema.get(i).unwrap() {
-                ChildType::Simple(FlatTypes::Union) => {val += 1;},
-                ChildType::List(FlatTypes::Union) => {val += 1;},
+            match self.schema.0.get(i) {
+                Some(ChildType::Simple(FlatTypes::Union)) => {val += 1;},
+                Some(ChildType::List(FlatTypes::Union)) => {val += 1;},
                 _ => ()
             }
         }
-        if val >= self.offsets.len() {
+        if val >= self.schema.0.len() {
             return Err(PyIndexError::new_err("Out of range"))
+        }
+        if val >= self.offsets.len() {
+            return Ok(().into_py(py)) // None - no offset
         }
         let off = self.offsets[val] as usize;
         if off == 0 {
-            return Ok(().into_py(py))
+            return Ok(().into_py(py)) // None - offset set to 0
         }
         match typ {
             ChildType::Simple(x) =>
@@ -274,16 +312,8 @@ fn py_footer(buf: &PyAny) -> PyResult<FlatTable> {
     Ok(parse_feather(cur, true)?)
 }
 
-/// Formats the sum of two numbers as string.
-#[pyfunction]
-fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-    Ok((a + b).to_string())
-}
-
-/// A Python module implemented in Rust.
 #[pymodule]
 fn fastfeather(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(sum_as_string, m)?)?;
     m.add_class::<FlatTable>()?;
     m.add_function(wrap_pyfunction!(py_footer, m)?)?;
     Ok(())

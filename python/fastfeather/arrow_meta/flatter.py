@@ -158,20 +158,18 @@ def parse_table(f, fieldspec: dict, root=False):
     """Construct python dic from a flatbuffer table with given spec"""
     if root:
         root_offset = int.from_bytes(f.read(4), "little")  # must be positive
-        print("root", f.seek(root_offset - 4, 1))
+        print("root", f.seek(root_offset - 4, 1)-pos0)
 
     table0 = f.tell()  # start of TABLE
     voff = int.from_bytes(f.read(4), "little", signed=True)
 
     v0 = table0 - voff  # start of Vtable
-    if root:
-        print(voff, v0)
     f.seek(v0)
     vsize = int.from_bytes(f.read(2), "little")
     tsize = int.from_bytes(f.read(2), "little")
     n_offsets = (vsize // 2) - 2
     field_offsets = [int.from_bytes(f.read(2), "little") for _ in range(n_offsets)]
-    print(v0, vsize, n_offsets, field_offsets)
+    print("TABLE", table0-pos0, v0-pos0, vsize, n_offsets, field_offsets, list(fieldspec))
 
     out = {}
     specs = iter(fieldspec.items())
@@ -188,6 +186,7 @@ def parse_table(f, fieldspec: dict, root=False):
             enum = False
         if off == 0 or fieldtype is None:
             # not present or explicitly skipped
+            print(fieldname, "to None because of ", "offset" if off == 0 else "schema")
             out[fieldname] = None
             # TODO: may have default value
             continue
@@ -217,6 +216,7 @@ def parse_table(f, fieldspec: dict, root=False):
 def parse_inner(f, fieldtype, etype=None):
     """Infer single field value within a table or list"""
     pos = f.tell()  # start of FIELD
+    print("pos", pos-pos0, "type", type(fieldtype))
     if fieldtype == "string":
         offset = int.from_bytes(f.read(4), "little")
         f.seek(pos + offset)
@@ -229,6 +229,7 @@ def parse_inner(f, fieldtype, etype=None):
         offset = int.from_bytes(f.read(4), "little")
         f.seek(pos + offset)
         vecsize = int.from_bytes(f.read(4), "little")
+        print("list", f.tell()-pos0, vecsize)
         if isinstance(fieldtype[0], Union):
             # vector of tables, each a different union member according to etype
             oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
@@ -247,6 +248,7 @@ def parse_inner(f, fieldtype, etype=None):
             oroff = [(f.tell(), int.from_bytes(f.read(4), "little")) for _ in range(vecsize)]
             val = []
             for origin, offset in oroff:
+                print("OROFF", origin-pos0, offset)
                 f.seek(origin + offset)
                 val.append(parse_table(f, fieldtype[0]))
         else:
@@ -291,12 +293,16 @@ def parse_inner(f, fieldtype, etype=None):
     return val
 
 
+pos0 = 0
+
+
 def parse_feather(infile):
     """Main entry point: get schema and offsets from file footer"""
+    global pos0
     infile.seek(-10, 2)
     size = int.from_bytes(infile.read(4), "little")
     assert infile.read() == b"ARROW1"
-    print("pos", infile.seek(-size - 10, 2))
+    pos0 += infile.seek(-size - 10, 2)
     return parse_table(infile, footer, root=True)
 
 
