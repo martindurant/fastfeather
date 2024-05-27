@@ -167,10 +167,12 @@ fn py_to_byteslice(value: &PyAny) -> &'static mut [u8] {
 impl FlatTable {
     pub fn new(name: String, buf: Arc<Vec<u8>>, offset: usize) -> Self {
         let schema = SCHEMAS.get(name.as_str()).unwrap();
-        let voff = LittleEndian::read_u32(&buf[offset..offset+4]) as usize;
-        let vsize = LittleEndian::read_u16(&buf[offset - voff..offset - voff + 2]);
+        let voff = LittleEndian::read_i32(&buf[offset .. offset + 4]);
+        let off_voff = (offset as i32 - voff) as usize;
+        let vsize = LittleEndian::read_u16(&buf[off_voff .. off_voff + 2]);
         let noffsets = (vsize / 2) - 2;
-        let mut offsets: Vec<i16> = (offset - voff + 4.. offset - voff + 4 + noffsets as usize * 2)
+        let offsets: Vec<i16> =
+            (off_voff + 4 .. off_voff + 4 + noffsets as usize * 2)
             .step_by(2)
             .map(|x| LittleEndian::read_i16(&buf[x .. x + 2]))
             .collect();
@@ -211,11 +213,17 @@ impl FlatTable {
             FlatTypes::Double => {
                 OutTypes::Fumber(LittleEndian::read_f64(&self.buf[offset .. offset + 8]))
             }
+            FlatTypes::Value(s) => OutTypes::Str(s.to_string()),
             _ => OutTypes::Empty
         }
     }
 
-    fn get_list(&self, mut offset: usize, typ: &FlatTypes) -> Vec<OutTypes> {
+    fn get_union(&self, choice_offset: usize, value_offset: usize, typ: &[FlatTypes]) -> OutTypes {
+        let typ = &typ[self.buf[choice_offset] as usize];
+        self.get_simple_type(value_offset, typ)
+    }
+
+    fn get_list(&self, offset: usize, typ: &FlatTypes) -> Vec<OutTypes> {
         let off = LittleEndian::read_u32(&self.buf[offset .. offset + 4]) as usize;
         let size = LittleEndian::read_u32(&self.buf[offset + off .. offset + off + 4]) as usize;
         let el_size: usize = match typ {
@@ -244,12 +252,16 @@ impl fmt::Debug for FlatTable {
 #[pymethods]
 impl FlatTable {
     #[new]
-    fn newtest<'py>(py: Python, name: String, buf: &PyAny, offset: usize) -> Self {
+    fn newtest<'py>(_py: Python, name: String, buf: &PyAny, offset: usize) -> Self {
         FlatTable::new(name, Arc::new(py_to_byteslice(buf).to_vec()), offset)
     }
 
     fn __str__<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
         Ok(format!("{:?}", self).into_py(py))
+    }
+
+    fn __repr__<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+        Ok(format!("<FlatTable '{}'>", self.name).into_py(py))
     }
 
     fn field_name(&self, num: usize) -> PyResult<String> {
@@ -263,7 +275,7 @@ impl FlatTable {
     fn get<'py>(&self, py: Python<'py>, mut val: usize) -> PyResult<PyObject> {
         let typ = self.schema.0.get(val as usize);
         if typ.is_none() {
-            return Ok(().into_py(py)) // None
+            return Ok(().into_py(py)) // None from schema def
         }
         let typ: &ChildType = typ.unwrap();
         for i in 0..val {
@@ -288,6 +300,10 @@ impl FlatTable {
                 Ok(self.get_simple_type(self.offset + off, x).into_py(py)),
             ChildType::List(typ) =>
                 Ok(self.get_list(self.offset + off, typ).into_py(py)),
+            ChildType::Un(typ) => {
+                let off2 = self.offsets[val + 1] as usize;
+                Ok(self.get_union(self.offset + off, self.offset + off2, typ).into_py(py))
+            }
             _ => Ok(().into_py(py))
         }
     }

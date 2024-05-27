@@ -258,6 +258,7 @@ def parse_inner(f, fieldtype, etype=None):
         # should always be a collection of tables
         if isinstance(fieldtype[etype], dict):
             offset = int.from_bytes(f.read(4), "little")
+            print("UNION", etype, fieldtype[etype], fieldtype[etype].name, pos - pos0, offset)
             f.seek(pos + offset)
             val = parse_table(f, fieldtype[etype])
             val["etype"] = fieldtype[etype].name
@@ -299,6 +300,7 @@ pos0 = 0
 def parse_feather(infile):
     """Main entry point: get schema and offsets from file footer"""
     global pos0
+    pos0 -= pos0
     infile.seek(-10, 2)
     size = int.from_bytes(infile.read(4), "little")
     assert infile.read() == b"ARROW1"
