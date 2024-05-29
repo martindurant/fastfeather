@@ -1,12 +1,14 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use pyo3::prelude::*;
 use std::io::{self, Cursor, Error, ErrorKind, Read, Seek, SeekFrom};
 use std::slice;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use std::sync::Arc;
 use std::fmt;
+use std::fmt::{Display, Formatter};
+use std::thread::current;
 use pyo3::buffer::PyBuffer;
-use pyo3::exceptions::PyIndexError;
+use pyo3::exceptions::{PyAttributeError, PyIndexError};
 
 #[macro_use]
 extern crate lazy_static;
@@ -140,6 +142,11 @@ enum OutTypes {
     Empty
 }
 
+enum InnerGet {
+    Simple(OutTypes),
+    List(Vec<OutTypes>)
+}
+
 impl IntoPy<PyObject> for OutTypes {
     fn into_py(self, py: Python<'_>) -> PyObject {
         match self.clone() {
@@ -163,6 +170,16 @@ fn py_to_byteslice(value: &PyAny) -> &'static mut [u8] {
     }
 }
 
+
+#[derive(Debug)]
+struct MyError {}
+
+impl Display for MyError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
+}
+impl std::error::Error for MyError {}
 
 impl FlatTable {
     pub fn new(name: String, buf: Arc<Vec<u8>>, offset: usize) -> Self {
@@ -237,7 +254,33 @@ impl FlatTable {
             self.get_simple_type(off + offset + 4 + i * el_size, typ)
         }).collect()
     }
-}
+
+    fn get_inner(&self, mut val: usize) -> Result<InnerGet, MyError> {
+        let typ: &ChildType = self.schema.0.get(val as usize).expect("");
+        for i in 0..val {
+            match self.schema.0.get(i) {
+                Some(ChildType::Simple(FlatTypes::Union)) => {val += 1;},
+                Some(ChildType::List(FlatTypes::Union)) => {val += 1;},
+                _ => ()
+            }
+        }
+        let off = self.offsets[val] as usize;
+        if off == 0 {
+            return Err(MyError {})
+        }
+        match typ {
+            ChildType::Simple(x) =>
+                Ok(InnerGet::Simple(self.get_simple_type(self.offset + off, x))),
+            ChildType::List(typ) =>
+                Ok(InnerGet::List(self.get_list(self.offset + off, typ))),
+            ChildType::Un(typ) => {
+                let off2 = self.offsets[val + 1] as usize;
+                Ok(InnerGet::Simple(self.get_union(self.offset + off, self.offset + off2, typ)))
+            }
+            _ => Err(MyError {})
+        }
+    }
+
 
 impl fmt::Debug for FlatTable {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -272,42 +315,22 @@ impl FlatTable {
         Ok(self.schema.0.len())
     }
 
-    fn get<'py>(&self, py: Python<'py>, mut val: usize) -> PyResult<PyObject> {
-        let typ = self.schema.0.get(val as usize);
-        if typ.is_none() {
-            return Ok(().into_py(py)) // None from schema def
-        }
-        let typ: &ChildType = typ.unwrap();
-        for i in 0..val {
-            match self.schema.0.get(i) {
-                Some(ChildType::Simple(FlatTypes::Union)) => {val += 1;},
-                Some(ChildType::List(FlatTypes::Union)) => {val += 1;},
-                _ => ()
-            }
-        }
-        if val >= self.schema.0.len() {
-            return Err(PyIndexError::new_err("Out of range"))
-        }
-        if val >= self.offsets.len() {
-            return Ok(().into_py(py)) // None - no offset
-        }
-        let off = self.offsets[val] as usize;
-        if off == 0 {
-            return Ok(().into_py(py)) // None - offset set to 0
-        }
-        match typ {
-            ChildType::Simple(x) =>
-                Ok(self.get_simple_type(self.offset + off, x).into_py(py)),
-            ChildType::List(typ) =>
-                Ok(self.get_list(self.offset + off, typ).into_py(py)),
-            ChildType::Un(typ) => {
-                let off2 = self.offsets[val + 1] as usize;
-                Ok(self.get_union(self.offset + off, self.offset + off2, typ).into_py(py))
-            }
-            _ => Ok(().into_py(py))
+    fn __getattr__<'py>(&self, py:Python<'py>, name: &str) -> PyResult<PyObject> {
+        let ind =self.schema.1.iter().position(|field| field.eq(&name));
+        match ind {
+            Some(x) => self.__getitem__(py, x),
+            None => Err(PyAttributeError::new_err(name.to_string()))
         }
     }
-}
+
+    fn __getitem__<'py>(&self, py: Python<'py>, val: usize) -> PyResult<PyObject> {
+        let out = self.get_inner(val);
+        match out {
+            Ok(InnerGet::Simple(x)) => Ok(x.into_py(py)),
+            Ok(InnerGet::List(x)) => Ok(x.into_py(py)),
+            Err(_) => Ok(().into_py(py))
+        }
+    }
 
 fn parse_feather<I: Read + Seek>(mut reader: I, root: bool) -> io::Result<FlatTable>{
     reader.seek(SeekFrom::End(-10))?;
