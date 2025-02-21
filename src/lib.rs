@@ -1,12 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use pyo3::prelude::*;
 use std::io::{self, Cursor, Error, ErrorKind, Read, Seek, SeekFrom};
-use std::slice;
 use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 use std::sync::Arc;
 use std::fmt;
+use std::slice;
 use std::fmt::{Display, Formatter};
-use std::thread::current;
 use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyAttributeError, PyIndexError};
 
@@ -181,7 +180,7 @@ impl Display for MyError {
 }
 impl std::error::Error for MyError {}
 
-impl FlatTable {
+impl FlatTable { 
     pub fn new(name: String, buf: Arc<Vec<u8>>, offset: usize) -> Self {
         let schema = SCHEMAS.get(name.as_str()).unwrap();
         let voff = LittleEndian::read_i32(&buf[offset .. offset + 4]);
@@ -280,6 +279,7 @@ impl FlatTable {
             _ => Err(MyError {})
         }
     }
+}
 
 
 impl fmt::Debug for FlatTable {
@@ -331,6 +331,7 @@ impl FlatTable {
             Err(_) => Ok(().into_py(py))
         }
     }
+}
 
 fn parse_feather<I: Read + Seek>(mut reader: I, root: bool) -> io::Result<FlatTable>{
     reader.seek(SeekFrom::End(-10))?;
